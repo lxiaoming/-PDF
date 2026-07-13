@@ -13,6 +13,7 @@ import struct
 import tempfile
 import threading
 import tkinter as tk
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from io import BytesIO
 from tkinter import filedialog, messagebox, ttk
@@ -78,31 +79,55 @@ def _make_pdf_from_images(
     output_pdf_path: str,
     quality: int = 85,
     progress_callback=None,
+    max_workers: int = 4,
 ) -> str:
-    temp_dir = tempfile.mkdtemp(prefix="img2pdf_")
-    jpeg_paths: list[str] = []
-    temp_files: list[str] = []
+    """将图片列表转为 PDF。
+    - 第 1 阶段：并行转换非 JPEG 图片为 JPEG（内存友好）
+    - 第 2 阶段：流式写入 PDF（每次只持有一张图片数据）
+    """
     total = len(image_paths)
+    temp_dir = tempfile.mkdtemp(prefix="img2pdf_")
+    temp_files: list[str] = []
 
     try:
+        # --- 第 1 阶段：准备 JPEG 列表（非 JPEG 并行转换）---
+        # 保持原始顺序，jpeg_paths 与 image_paths 一一对应
+        jpeg_paths: list[str] = [""] * total
+        convert_tasks: list[tuple[int, str]] = []  # (index, src_path)
+
         for idx, img_path in enumerate(image_paths):
-            if progress_callback:
-                progress_callback(idx + 1, total, f"准备: {os.path.basename(img_path)}")
             ext = os.path.splitext(img_path)[1].lower()
             if ext in (".jpg", ".jpeg"):
-                jpeg_paths.append(img_path)
+                jpeg_paths[idx] = img_path
             else:
                 tmp_name = os.path.join(
                     temp_dir,
-                    f"{os.path.splitext(os.path.basename(img_path))[0]}.jpg",
+                    f"{idx:06d}_{os.path.splitext(os.path.basename(img_path))[0]}.jpg",
                 )
-                _convert_to_jpeg(img_path, tmp_name, quality)
-                jpeg_paths.append(tmp_name)
+                jpeg_paths[idx] = tmp_name
+                convert_tasks.append((idx, img_path))
                 temp_files.append(tmp_name)
 
-        pdf_bytes = _build_pdf(jpeg_paths, quality, progress_callback, offset=total)
-        with open(output_pdf_path, "wb") as fh:
-            fh.write(pdf_bytes)
+        # 并行转换非 JPEG 图片
+        if convert_tasks:
+            converted = 0
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {
+                    executor.submit(_convert_to_jpeg, src, jpeg_paths[idx], quality): idx
+                    for idx, src in convert_tasks
+                }
+                for future in as_completed(futures):
+                    future.result()  # 抛出转换异常（如果有）
+                    converted += 1
+                    if progress_callback:
+                        progress_callback(converted, total, "格式转换中…")
+
+        # --- 第 2 阶段：流式写入 PDF ---
+        _build_pdf_streaming(
+            jpeg_paths, output_pdf_path,
+            progress_callback=progress_callback,
+            convert_offset=len(convert_tasks),
+        )
         return output_pdf_path
 
     finally:
@@ -117,85 +142,134 @@ def _make_pdf_from_images(
             pass
 
 
-def _build_pdf(jpeg_paths, quality, progress_callback=None, offset=0):
-    pdf = BytesIO()
-    objects: list[tuple[int, bytes]] = []
+def _build_pdf_streaming(
+    jpeg_paths: list[str],
+    output_pdf_path: str,
+    progress_callback=None,
+    convert_offset: int = 0,
+) -> None:
+    """流式构建 PDF，每次只持有一张图片在内存中。"""
+    total = len(jpeg_paths)
+    total_objects = 2 + total * 3  # catalog(1) + pages(1) + 每页3个(image/content/page)
+    offsets: list[int] = []       # offsets[i] = (image_id, content_id, page_id 的字节偏移)
+    obj_id_seq = [0]              # 对象 ID 计数器
 
-    def obj(id_, content):
-        objects.append((id_, content))
+    def next_id() -> int:
+        obj_id_seq[0] += 1
+        return obj_id_seq[0]
 
-    pages_info: list[dict] = []
-    for idx, jpg_path in enumerate(jpeg_paths):
-        if progress_callback:
-            progress_callback(
-                offset + idx + 1,
-                offset + len(jpeg_paths),
-                f"嵌入: {os.path.basename(jpg_path)}",
+    # 预分配所有对象 ID
+    catalog_id = next_id()
+    pages_id = next_id()
+    id_triplets: list[tuple[int, int, int]] = []  # [(image_id, content_id, page_id), ...]
+    for _ in range(total):
+        id_triplets.append((next_id(), next_id(), next_id()))
+
+    # 写入临时文件
+    tmp_fd, tmp_path = tempfile.mkstemp(prefix="pdf_stream_")
+    try:
+        with os.fdopen(tmp_fd, "wb") as fh:
+            # --- PDF 头部 ---
+            fh.write(b"%PDF-1.4\n%\xff\xff\xff\xff\n")
+
+            # --- Catalog 对象 ---
+            cat_offset = fh.tell()
+            cat_bytes = _catalog(pages_id)
+            fh.write(f"{catalog_id} 0 obj\n".encode())
+            fh.write(cat_bytes)
+            if not cat_bytes.endswith(b"\n"):
+                fh.write(b"\n")
+            fh.write(b"endobj\n")
+
+            # --- Pages 对象 ---
+            pages_offset = fh.tell()
+            page_ids = [t[2] for t in id_triplets]
+            pages_bytes = _pages(page_ids)
+            fh.write(f"{pages_id} 0 obj\n".encode())
+            fh.write(pages_bytes)
+            if not pages_bytes.endswith(b"\n"):
+                fh.write(b"\n")
+            fh.write(b"endobj\n")
+
+            # --- 逐张写入图片/内容/页面对象 ---
+            for idx, jpg_path in enumerate(jpeg_paths):
+                if progress_callback:
+                    progress_callback(
+                        convert_offset + idx + 1, total,
+                        f"嵌入: {os.path.basename(jpg_path)}",
+                    )
+
+                img_id, ct_id, pg_id = id_triplets[idx]
+
+                # 读取维度（只读文件头，不加载整张图）
+                w, h = _get_jpeg_dimensions(jpg_path)
+
+                # 计算布局
+                avail_w = PAGE_W - 2 * MARGIN
+                avail_h = PAGE_H - 2 * MARGIN
+                scale = min(avail_w / w, avail_h / h, 1.0)
+                info = {
+                    "width": w, "height": h,
+                    "draw_w": w * scale, "draw_h": h * scale,
+                    "x": (PAGE_W - w * scale) / 2.0,
+                    "y": (PAGE_H - h * scale) / 2.0,
+                }
+
+                off1 = fh.tell()
+                img_bytes = _image_xobject_streaming(jpg_path, info)
+                fh.write(f"{img_id} 0 obj\n".encode())
+                fh.write(img_bytes)
+                if not img_bytes.endswith(b"\n"):
+                    fh.write(b"\n")
+                fh.write(b"endobj\n")
+
+                off2 = fh.tell()
+                ct_bytes = _content_stream(img_id, info)
+                fh.write(f"{ct_id} 0 obj\n".encode())
+                fh.write(ct_bytes)
+                if not ct_bytes.endswith(b"\n"):
+                    fh.write(b"\n")
+                fh.write(b"endobj\n")
+
+                off3 = fh.tell()
+                pg_bytes = _page_obj(pg_id, ct_id, img_id)
+                fh.write(f"{pg_id} 0 obj\n".encode())
+                fh.write(pg_bytes)
+                if not pg_bytes.endswith(b"\n"):
+                    fh.write(b"\n")
+                fh.write(b"endobj\n")
+
+                offsets.extend([off1, off2, off3])
+
+            # --- 交叉引用表 ---
+            xref_offset = fh.tell()
+            fh.write(b"xref\n")
+            fh.write(f"0 {total_objects + 1}\n".encode())
+            fh.write(b"0000000000 65535 f \n")
+            # catalog
+            fh.write(f"{cat_offset:010d} 00000 n \n".encode())
+            # pages
+            fh.write(f"{pages_offset:010d} 00000 n \n".encode())
+            # image / content / page（按 ID 顺序）
+            for off in offsets:
+                fh.write(f"{off:010d} 00000 n \n".encode())
+
+            # --- Trailer ---
+            trailer = (
+                f"trailer\n<< /Size {total_objects + 1} /Root {catalog_id} 0 R >>\n"
+                f"startxref\n{xref_offset}\n%%EOF"
             )
-        w, h = _get_jpeg_dimensions(jpg_path)
-        with open(jpg_path, "rb") as fh:
-            jpg_data = fh.read()
+            fh.write(trailer.encode())
 
-        avail_w = PAGE_W - 2 * MARGIN
-        avail_h = PAGE_H - 2 * MARGIN
-        scale = min(avail_w / w, avail_h / h, 1.0)
-        draw_w = w * scale
-        draw_h = h * scale
-        x = (PAGE_W - draw_w) / 2.0
-        y = (PAGE_H - draw_h) / 2.0
+        # 写入目标路径
+        os.replace(tmp_path, output_pdf_path)
 
-        pages_info.append({
-            "width": w, "height": h,
-            "draw_w": draw_w, "draw_h": draw_h,
-            "x": x, "y": y, "data": jpg_data,
-        })
-
-    next_id = [1]
-
-    def new_id():
-        n = next_id[0]; next_id[0] += 1; return n
-
-    catalog_id = new_id()
-    pages_id = new_id()
-
-    page_ids, image_ids, content_ids = [], [], []
-    for _ in pages_info:
-        page_ids.append(new_id())
-        image_ids.append(new_id())
-        content_ids.append(new_id())
-
-    obj(catalog_id, _catalog(pages_id))
-    obj(pages_id, _pages(page_ids))
-
-    for i, info in enumerate(pages_info):
-        obj(image_ids[i], _image_xobject(info))
-        obj(content_ids[i], _content_stream(image_ids[i], info))
-        obj(page_ids[i], _page_obj(page_ids[i], content_ids[i], image_ids[i]))
-
-    pdf.write(b"%PDF-1.4\n%\xff\xff\xff\xff\n")
-
-    offsets: dict[int, int] = {}
-    for obj_id, content in objects:
-        offsets[obj_id] = pdf.tell()
-        pdf.write(f"{obj_id} 0 obj\n".encode())
-        pdf.write(content)
-        if not content.endswith(b"\n"):
-            pdf.write(b"\n")
-        pdf.write(b"endobj\n")
-
-    xref_offset = pdf.tell()
-    pdf.write(b"xref\n")
-    pdf.write(f"0 {len(objects) + 1}\n".encode())
-    pdf.write(b"0000000000 65535 f \n")
-    for obj_id in sorted(offsets.keys()):
-        pdf.write(f"{offsets[obj_id]:010d} 00000 n \n".encode())
-
-    trailer = (
-        f"trailer\n<< /Size {len(objects) + 1} /Root {catalog_id} 0 R >>\n"
-        f"startxref\n{xref_offset}\n%%EOF"
-    )
-    pdf.write(trailer.encode())
-    return pdf.getvalue()
+    except BaseException:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def _catalog(pages_id):
@@ -217,16 +291,19 @@ def _page_obj(page_id, content_id, image_id):
     ).encode()
 
 
-def _image_xobject(info):
+def _image_xobject_streaming(jpg_path: str, info: dict) -> bytes:
+    """从文件路径读取 JPEG 数据并生成 Image XObject（流式，不缓存全部数据）。"""
+    with open(jpg_path, "rb") as fh:
+        jpg_data = fh.read()
     return (
         f"<< /Type /XObject /Subtype /Image\n"
         f"   /Width {info['width']} /Height {info['height']}\n"
         f"   /ColorSpace /DeviceRGB\n"
         f"   /BitsPerComponent 8\n"
         f"   /Filter /DCTDecode\n"
-        f"   /Length {len(info['data'])}\n"
+        f"   /Length {len(jpg_data)}\n"
         f">>\nstream\n"
-    ).encode() + info["data"] + b"\nendstream\n"
+    ).encode() + jpg_data + b"\nendstream\n"
 
 
 def _content_stream(image_id, info):
@@ -429,6 +506,13 @@ class ImageToPdfApp:
         self.progress = ttk.Progressbar(self.root, mode="determinate")
         self.progress.pack(fill=tk.X, padx=16, pady=(0, 4))
 
+        stats_frame = tk.Frame(self.root)
+        stats_frame.pack(fill=tk.X, padx=16)
+        self.lbl_stats = tk.Label(
+            stats_frame, text="", fg="#333", anchor="w", font=("Menlo", 10),
+        )
+        self.lbl_stats.pack(side=tk.LEFT)
+
         self.lbl_status = tk.Label(self.root, text="就绪", fg="gray", anchor="w")
         self.lbl_status.pack(fill=tk.X, padx=16, pady=(0, 8))
 
@@ -541,84 +625,105 @@ class ImageToPdfApp:
 
         quality = self.scale_quality.get()
         folders_snapshot = {k: list(v) for k, v in non_empty.items()}
+        total_folders = len(folders_snapshot)
         total_images = sum(len(v) for v in folders_snapshot.values())
 
         self._set_ui_state(tk.DISABLED)
         self.progress["value"] = 0
-        self.progress["maximum"] = total_images
+        self.progress["maximum"] = total_folders
+        self.lbl_stats.config(text=f"📊 文件夹总数: {total_folders}  |  ✅ 成功: 0  |  ❌ 失败: 0")
+        self._update_status("开始生成…")
 
         def _run():
-            try:
-                generated_pdfs: list[str] = []
-                processed = 0
+            success = 0
+            fail = 0
+            processed_images = 0
 
-                for folder_path, img_paths in folders_snapshot.items():
-                    rel = os.path.relpath(folder_path, self.root_path)
-                    pdf_name = os.path.basename(folder_path) + ".pdf"
-                    pdf_dir = os.path.join(output_dir, rel)
-                    os.makedirs(pdf_dir, exist_ok=True)
-                    pdf_path = os.path.join(pdf_dir, pdf_name)
+            for folder_path, img_paths in folders_snapshot.items():
+                rel = os.path.relpath(folder_path, self.root_path)
+                pdf_name = os.path.basename(folder_path) + ".pdf"
+                pdf_dir = os.path.join(output_dir, rel)
+                os.makedirs(pdf_dir, exist_ok=True)
+                pdf_path = os.path.join(pdf_dir, pdf_name)
 
-                    def make_cb(offset):
-                        def cb(cur, tot, msg):
-                            self.root.after(
-                                0,
-                                lambda: self._update_progress(
-                                    offset + cur, total_images, msg
-                                ),
-                            )
-                        return cb
+                def make_cb(offset):
+                    def cb(cur, tot, msg):
+                        self.root.after(0, lambda: self._update_progress_detail(
+                            offset + cur, total_images, msg
+                        ))
+                    return cb
 
+                try:
                     _make_pdf_from_images(
                         img_paths, pdf_path, quality=quality,
-                        progress_callback=make_cb(processed),
+                        progress_callback=make_cb(processed_images),
                     )
-                    generated_pdfs.append(pdf_path)
-                    processed += len(img_paths)
+                    self.pdf_history.append(pdf_path)
+                    success += 1
+                    self.root.after(
+                        0, lambda p=pdf_path: self._on_one_success(p)
+                    )
+                except Exception as e:
+                    fail += 1
+                    rel_path = os.path.join(rel, pdf_name) if rel != "." else pdf_name
+                    self.root.after(
+                        0, lambda r=rel_path, msg=str(e): self._on_one_fail(r, msg)
+                    )
 
-                self.root.after(0, lambda: self._on_success(generated_pdfs))
-            except Exception as e:
-                self.root.after(0, lambda: self._on_error(str(e)))
+                processed_images += len(img_paths)
+                # 更新统计
+                s, f = success, fail
+                self.root.after(0, lambda s=s, f=f: self._update_stats(s, f))
+                # 更新文件夹级进度
+                done = success + fail
+                self.root.after(0, lambda d=done: self._update_folder_progress(d))
+
+            # 全部完成
+            total = total_folders
+            self.root.after(0, lambda: self._on_all_done(success, fail, total))
 
         threading.Thread(target=_run, daemon=True).start()
 
-    def _update_progress(self, current, total, msg):
-        self.progress["value"] = current
-        self.progress["maximum"] = total
+    # -------------------------------------------------------------------
+
+    def _update_folder_progress(self, done: int):
+        """更新文件夹级别的进度条。"""
+        self.progress["value"] = done
+
+    def _update_progress_detail(self, current: int, total: int, msg: str):
+        """更新图片级别的状态文字。"""
         self.lbl_status.config(text=msg)
 
-    def _on_success(self, pdf_paths: list[str]):
-        self._set_ui_state(tk.NORMAL)
-        self.progress["value"] = 0
-
-        ts = datetime.now().strftime("%H:%M:%S")
-        self.text_history.config(state=tk.NORMAL)
-        for p in pdf_paths:
-            self.pdf_history.append(p)
-            self.text_history.insert(tk.END, f"[{ts}] ✅ {p}\n")
-        self.text_history.see(tk.END)
-        self.text_history.config(state=tk.DISABLED)
-
-        count = len(pdf_paths)
-        self._update_status(f"成功生成 {count} 个 PDF")
-        self.root.lift()
-        messagebox.showinfo(
-            "生成成功",
-            f"共生成 {count} 个 PDF：\n\n" + "\n".join(pdf_paths),
+    def _update_stats(self, success: int, fail: int):
+        """更新成功/失败统计标签。"""
+        total = self.progress["maximum"]
+        self.lbl_stats.config(
+            text=f"📊 文件夹总数: {int(total)}  |  ✅ 成功: {success}  |  ❌ 失败: {fail}"
         )
 
-    def _on_error(self, error_msg: str):
-        self._set_ui_state(tk.NORMAL)
-        self.progress["value"] = 0
-        self._update_status("生成失败")
-
+    def _on_one_success(self, pdf_path: str):
+        """实时追加一条成功记录到历史面板。"""
         ts = datetime.now().strftime("%H:%M:%S")
         self.text_history.config(state=tk.NORMAL)
-        self.text_history.insert(tk.END, f"[{ts}] ❌ 失败: {error_msg}\n")
+        self.text_history.insert(tk.END, f"[{ts}] ✅ {pdf_path}\n")
         self.text_history.see(tk.END)
         self.text_history.config(state=tk.DISABLED)
 
-        messagebox.showerror("生成失败", f"错误信息：\n{error_msg}")
+    def _on_one_fail(self, rel_path: str, error: str):
+        """实时追加一条失败记录到历史面板。"""
+        ts = datetime.now().strftime("%H:%M:%S")
+        self.text_history.config(state=tk.NORMAL)
+        self.text_history.insert(tk.END, f"[{ts}] ❌ {rel_path}  —  {error}\n")
+        self.text_history.see(tk.END)
+        self.text_history.config(state=tk.DISABLED)
+
+    def _on_all_done(self, success: int, fail: int, total: int):
+        """全部转换完成，恢复 UI。"""
+        self._set_ui_state(tk.NORMAL)
+        self.progress["value"] = 0
+        self._update_stats(success, fail)
+        self._update_status(f"转换完成（成功 {success}，失败 {fail}）")
+        self.root.lift()
 
     # -----------------------------------------------------------------------
     # 辅助方法
