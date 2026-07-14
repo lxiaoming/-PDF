@@ -500,6 +500,8 @@ class ImageToPdfApp:
             font=("Menlo", 10),
             state=tk.DISABLED,
         )
+        self.text_history.tag_config("success", foreground="#2a7d2a")
+        self.text_history.tag_config("fail", foreground="#c0392b")
         self.text_history.pack(fill=tk.BOTH, expand=True)
         hist_scrollbar.config(command=self.text_history.yview)
 
@@ -691,7 +693,7 @@ class ImageToPdfApp:
         """实时追加一条成功记录到历史面板。"""
         ts = datetime.now().strftime("%H:%M:%S")
         self.text_history.config(state=tk.NORMAL)
-        self.text_history.insert(tk.END, f"[{ts}] ✅ {pdf_path}\n")
+        self.text_history.insert(tk.END, f"[{ts}] ✅ {pdf_path}\n", "success")
         self.text_history.see(tk.END)
         self.text_history.config(state=tk.DISABLED)
 
@@ -699,7 +701,7 @@ class ImageToPdfApp:
         """实时追加一条失败记录到历史面板。"""
         ts = datetime.now().strftime("%H:%M:%S")
         self.text_history.config(state=tk.NORMAL)
-        self.text_history.insert(tk.END, f"[{ts}] ❌ {rel_path}  —  {error}\n")
+        self.text_history.insert(tk.END, f"[{ts}] ❌ {rel_path}  —  {error}\n", "fail")
         self.text_history.see(tk.END)
         self.text_history.config(state=tk.DISABLED)
 
