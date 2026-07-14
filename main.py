@@ -390,6 +390,8 @@ class ImageToPdfApp:
         self.root_path: str = ""
         self.folders: dict[str, list[str]] = {}  # {文件夹路径: [图片路径]}
         self.pdf_history: list[str] = []
+        self.history_entries: list[tuple[str, str]] = []  # [(type, text), ...] type: "success" | "fail"
+        self._history_filter: str = "all"  # "all" | "success" | "fail"
 
         # 输出目录：
         #   默认（未手动选择）：{root_parent}/{root_name}-pdf/
@@ -521,6 +523,35 @@ class ImageToPdfApp:
             self.root, text="⑤ 已生成的 PDF 历史", padx=10, pady=8
         )
         hist_frame.pack(fill=tk.BOTH, padx=16, pady=(0, 8), expand=True)
+
+        # 筛选按钮栏
+        filter_bar = tk.Frame(hist_frame)
+        filter_bar.pack(fill=tk.X, pady=(0, 4))
+
+        self.btn_filter_all = tk.Button(
+            filter_bar, text="全部", width=8,
+            command=lambda: self._on_filter_history("all"),
+        )
+        self.btn_filter_all.pack(side=tk.LEFT, padx=(0, 4))
+
+        self.btn_filter_success = tk.Button(
+            filter_bar, text="✅ 成功", width=8,
+            command=lambda: self._on_filter_history("success"),
+        )
+        self.btn_filter_success.pack(side=tk.LEFT, padx=4)
+
+        self.btn_filter_fail = tk.Button(
+            filter_bar, text="❌ 失败", width=8,
+            command=lambda: self._on_filter_history("fail"),
+        )
+        self.btn_filter_fail.pack(side=tk.LEFT, padx=4)
+
+        self.lbl_filter_count = tk.Label(
+            filter_bar, text="", fg="#888", font=("Menlo", 9), anchor="e",
+        )
+        self.lbl_filter_count.pack(side=tk.RIGHT)
+
+        self._highlight_filter_btn()
 
         hist_scrollbar = tk.Scrollbar(hist_frame)
         hist_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
@@ -724,18 +755,26 @@ class ImageToPdfApp:
     def _on_one_success(self, pdf_path: str):
         """实时追加一条成功记录到历史面板。"""
         ts = datetime.now().strftime("%H:%M:%S")
-        self.text_history.config(state=tk.NORMAL)
-        self.text_history.insert(tk.END, f"[{ts}] ✅ {pdf_path}\n", "success")
-        self.text_history.see(tk.END)
-        self.text_history.config(state=tk.DISABLED)
+        text = f"[{ts}] ✅ {pdf_path}\n"
+        self.history_entries.append(("success", text))
+        if self._history_filter in ("all", "success"):
+            self.text_history.config(state=tk.NORMAL)
+            self.text_history.insert(tk.END, text, "success")
+            self.text_history.see(tk.END)
+            self.text_history.config(state=tk.DISABLED)
+        self._update_filter_count()
 
     def _on_one_fail(self, rel_path: str, error: str):
         """实时追加一条失败记录到历史面板。"""
         ts = datetime.now().strftime("%H:%M:%S")
-        self.text_history.config(state=tk.NORMAL)
-        self.text_history.insert(tk.END, f"[{ts}] ❌ {rel_path}  —  {error}\n", "fail")
-        self.text_history.see(tk.END)
-        self.text_history.config(state=tk.DISABLED)
+        text = f"[{ts}] ❌ {rel_path}  —  {error}\n"
+        self.history_entries.append(("fail", text))
+        if self._history_filter in ("all", "fail"):
+            self.text_history.config(state=tk.NORMAL)
+            self.text_history.insert(tk.END, text, "fail")
+            self.text_history.see(tk.END)
+            self.text_history.config(state=tk.DISABLED)
+        self._update_filter_count()
 
     def _on_all_done(self, success: int, fail: int, total: int):
         """全部转换完成，恢复 UI。"""
@@ -744,6 +783,54 @@ class ImageToPdfApp:
         self._update_stats(success, fail)
         self._update_status(f"转换完成（成功 {success}，失败 {fail}）")
         self.root.lift()
+
+    # -----------------------------------------------------------------------
+    # 历史筛选
+    # -----------------------------------------------------------------------
+
+    def _on_filter_history(self, ftype: str):
+        """切换历史筛选条件。"""
+        self._history_filter = ftype
+        self._highlight_filter_btn()
+        self._render_history()
+
+    def _highlight_filter_btn(self):
+        """高亮当前选中的筛选按钮。"""
+        active_bg = "#b0bec5"
+        for btn, ftype in [
+            (self.btn_filter_all, "all"),
+            (self.btn_filter_success, "success"),
+            (self.btn_filter_fail, "fail"),
+        ]:
+            if ftype == self._history_filter:
+                btn.config(relief=tk.SUNKEN, bg=active_bg)
+            else:
+                btn.config(relief=tk.RAISED, bg="SystemButtonFace")
+
+    def _render_history(self):
+        """根据当前筛选条件重新渲染历史面板。"""
+        self.text_history.config(state=tk.NORMAL)
+        self.text_history.delete("1.0", tk.END)
+        for etype, text in self.history_entries:
+            if self._history_filter == "all" or self._history_filter == etype:
+                self.text_history.insert(tk.END, text, etype)
+        self.text_history.see(tk.END)
+        self.text_history.config(state=tk.DISABLED)
+        self._update_filter_count()
+
+    def _update_filter_count(self):
+        """更新筛选计数标签。"""
+        total = len(self.history_entries)
+        if total == 0:
+            self.lbl_filter_count.config(text="")
+            return
+        success = sum(1 for t, _ in self.history_entries if t == "success")
+        fail = total - success
+        visible = success if self._history_filter == "success" else (
+            fail if self._history_filter == "fail" else total)
+        self.lbl_filter_count.config(
+            text=f"显示 {visible}/{total}  |  ✅{success}  ❌{fail}"
+        )
 
     # -----------------------------------------------------------------------
     # 辅助方法
