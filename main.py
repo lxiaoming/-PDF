@@ -26,6 +26,11 @@ from PIL import Image
 
 SUPPORTED_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tiff", ".tif", ".webp"}
 
+# Windows / macOS 系统隐藏文件，扫描时直接跳过
+_SKIP_NAMES = {
+    "thumbs.db", "desktop.ini", "ehthumbs.db", ".ds_store",
+}
+
 PAGE_W = 595.0
 PAGE_H = 842.0
 MARGIN = 20.0
@@ -108,7 +113,7 @@ def _make_pdf_from_images(
                 convert_tasks.append((idx, img_path))
                 temp_files.append(tmp_name)
 
-        # 并行转换非 JPEG 图片
+        # 并行转换非 JPEG 图片（单张失败不影响其他）
         if convert_tasks:
             converted = 0
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -117,14 +122,35 @@ def _make_pdf_from_images(
                     for idx, src in convert_tasks
                 }
                 for future in as_completed(futures):
-                    future.result()  # 抛出转换异常（如果有）
+                    idx = futures[future]
+                    try:
+                        future.result()
+                    except Exception:
+                        # 单张转换失败：标记跳过，继续处理其余图片
+                        jpeg_paths[idx] = ""
                     converted += 1
                     if progress_callback:
                         progress_callback(converted, total, "格式转换中…")
+            # 过滤掉转换失败的图片
+            jpeg_paths = [p for p in jpeg_paths if p]
+            total = len(jpeg_paths)
+            if not jpeg_paths:
+                raise RuntimeError("所有图片格式转换均失败")
 
-        # --- 第 2 阶段：流式写入 PDF ---
+        # --- 第 2 阶段：预检 JPEG 可读性（跳过损坏文件）---
+        valid_paths: list[str] = []
+        for p in jpeg_paths:
+            try:
+                _get_jpeg_dimensions(p)
+                valid_paths.append(p)
+            except (ValueError, OSError):
+                pass  # 跳过无法读取的图片
+        if not valid_paths:
+            raise RuntimeError("所有图片均无法读取，可能是损坏的文件")
+
+        # --- 第 3 阶段：流式写入 PDF ---
         _build_pdf_streaming(
-            jpeg_paths, output_pdf_path,
+            valid_paths, output_pdf_path,
             progress_callback=progress_callback,
             convert_offset=len(convert_tasks),
         )
@@ -323,6 +349,12 @@ def scan_images_in_folder(folder_path: str) -> list[str]:
     images: list[str] = []
     try:
         for name in os.listdir(folder_path):
+            # 跳过隐藏文件和 Windows 系统文件
+            low = name.lower()
+            if name.startswith(".") or name.startswith("~$"):
+                continue
+            if low in _SKIP_NAMES:
+                continue
             ext = os.path.splitext(name)[1].lower()
             if ext in SUPPORTED_EXTS:
                 images.append(os.path.join(folder_path, name))
