@@ -351,9 +351,9 @@ class ImageToPdfApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("图片转 PDF 工具")
-        self.root.geometry("740x640")
+        self.root.geometry("740x800")
         self.root.resizable(True, True)
-        self.root.minsize(580, 500)
+        self.root.minsize(580, 600)
 
         self.root_path: str = ""
         self.folders: dict[str, list[str]] = {}  # {文件夹路径: [图片路径]}
@@ -513,7 +513,7 @@ class ImageToPdfApp:
         )
         self.lbl_stats.pack(side=tk.LEFT)
 
-        self.lbl_status = tk.Label(self.root, text="就绪", fg="gray", anchor="w")
+        self.lbl_status = tk.Label(self.root, text="就绪", fg="gray", anchor="w", font=("Menlo", 10))
         self.lbl_status.pack(fill=tk.X, padx=16, pady=(0, 8))
 
     # -----------------------------------------------------------------------
@@ -609,20 +609,6 @@ class ImageToPdfApp:
 
         output_dir = self._get_output_dir()
 
-        # 检查重名
-        conflicts = []
-        for folder_path in non_empty:
-            rel = os.path.relpath(folder_path, self.root_path)
-            pdf_name = os.path.basename(folder_path) + ".pdf"
-            pdf_path = os.path.join(output_dir, rel, pdf_name)
-            if os.path.exists(pdf_path):
-                conflicts.append(pdf_path)
-
-        if conflicts:
-            msg = "以下文件已存在，将被覆盖：\n\n" + "\n".join(conflicts)
-            if not messagebox.askyesno("文件冲突", msg + "\n\n是否继续？"):
-                return
-
         quality = self.scale_quality.get()
         folders_snapshot = {k: list(v) for k, v in non_empty.items()}
         total_folders = len(folders_snapshot)
@@ -644,7 +630,7 @@ class ImageToPdfApp:
                 pdf_name = os.path.basename(folder_path) + ".pdf"
                 pdf_dir = os.path.join(output_dir, rel)
                 os.makedirs(pdf_dir, exist_ok=True)
-                pdf_path = os.path.join(pdf_dir, pdf_name)
+                pdf_path = self._unique_pdf_path(os.path.join(pdf_dir, pdf_name))
 
                 def make_cb(offset):
                     def cb(cur, tot, msg):
@@ -740,6 +726,18 @@ class ImageToPdfApp:
                 tk.END, f"📁 {display}  ({len(images)} 张图片)"
             )
 
+    def _unique_pdf_path(self, pdf_path: str) -> str:
+        """如果文件已存在，追加序号（_1, _2 …）避免覆盖。"""
+        if not os.path.exists(pdf_path):
+            return pdf_path
+        base, ext = os.path.splitext(pdf_path)
+        counter = 1
+        while True:
+            new_path = f"{base}_{counter}{ext}"
+            if not os.path.exists(new_path):
+                return new_path
+            counter += 1
+
     def _update_count_label(self):
         total_folders = len(self.folders)
         total_images = sum(len(v) for v in self.folders.values())
@@ -774,7 +772,7 @@ class ImageToPdfApp:
             rel = os.path.relpath(folder_path, self.root_path)
             pdf_path = os.path.join(output_dir, rel, folder_name + ".pdf")
             display = os.path.join(root_display, rel, folder_name + ".pdf")
-            marker = " ⚠️ 将覆盖" if os.path.exists(pdf_path) else ""
+            marker = " → 自动追加" if os.path.exists(pdf_path) else ""
             self.text_preview.insert(
                 tk.END,
                 f"📄 {display}  ← {len(images)} 张图片{marker}\n",
